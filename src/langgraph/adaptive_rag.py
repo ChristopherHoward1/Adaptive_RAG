@@ -1,11 +1,26 @@
+import numpy as np
 
 from typing import Literal, List
+from typing_extensions import TypedDict
 
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.pydantic_v1 import BaseModel, Field
 from langchain_openai import ChatOpenAI
 from langchain.schema import BaseOutputParser
 from langchain import hub
+from langchain.docstore.document import Document
+from langchain.text_splitter import RecursiveCharacterTextSplitter
+from langchain.embeddings import OpenAIEmbeddings
+from langchain.vectorstores import FAISS
+from typing import List
+from rank_bm25 import BM25Okapi
+from pprint import pprint
+from langgraph.graph import END, StateGraph, START
+
+
+from helper_fns import process_file
+
+# Variables
 
 
 class RouteQuery(BaseModel):
@@ -13,7 +28,7 @@ class RouteQuery(BaseModel):
 
     datasource: Literal["vectorstore", "no-retrieval"] = Field(
         ...,
-        description="Given a user question choose to route it to a vectorstore or to the LLMs built in context.",
+        description="Given a user query choose to route it to a vectorstore or to the LLMs built in context.",
     )
 
 ### Query Analyzer
@@ -194,8 +209,9 @@ class QueryTransformer:
     def decompose_question(self, question: str) -> List[str]:
         """Decomposes the input question into simpler sub-questions."""
         subqueries = self.decomp_chain.invoke({"question": question}).subqueries
+        print("Decomposed Query:")
         for idx, question in enumerate(subqueries):
-            print(f"Subqueries\n Question {idx}: {question}")
+            print(f"Sub-query {idx}: {question}")
         return subqueries
 
 
@@ -313,7 +329,7 @@ class AnswerGrader:
 ### Reranker
 
 class RelevanceScore(BaseModel):
-    relevance_score: int = Field(gt=0, le=5, description="The relevance score of a document to a query.")
+    relevance_score: int = Field(gt=0, le=10, description="The relevance score of a document to a query.")
 
 
 class Reranker:
@@ -336,7 +352,7 @@ class Reranker:
         # Define the system prompt
         self.system_prompt = """You are an assistant that assigns a relevance score to a document based on its relevance to a query.\n
                                 If the document contains keyword(s) or semantic meaning related to the user question, it is considered relevant. \n
-                                The relevance score should be an integer from 1 (least relevant) to 5 (most relevant)."""
+                                The relevance score should be an integer from 1 (least relevant) to 10 (most relevant)."""
         
         # Create the prompt template
         self.rerank_prompt = ChatPromptTemplate.from_messages(
@@ -352,17 +368,50 @@ class Reranker:
         # Create the LLMChain
         self.retrieval_grader = self.rerank_prompt | self.structured_llm_reranker
 
+    def rerank_documents(self, query: str, documents: List[Document], top_n: int = 5) -> List[dict]:
+        """
+        Reranks the provided documents based on their relevance to the query.
+        
+        Args:
+            query (str): The user query.
+            documents (List[dict]): A list of documents, each with 'document_id' and 'content'.
+        
+        Returns:
+            List[dict]: The documents sorted by their relevance scores in descending order.
+        """
+        scored_documents = []
+        
+        for idx, doc in enumerate(documents):
+            try:
+                # Prepare the input for the chain
+                chain_input = {
+                    "query": query,
+                    "document": doc
+                }
+                # Invoke the chain to get the relevance score
+                scoring_result = self.chain.invoke(chain_input)
+                relevance_score = scoring_result.relevance_score
+                
+                # Add the relevance score to the document
+                doc_with_score = {
+                    "content": doc,
+                    "relevance_score": relevance_score
+                }
+                scored_documents.append(doc_with_score)
+            except Exception as e:
+                print(f"Error scoring document doc {idx}: {e}")
+                doc_with_score = {
+                    "content": doc,
+                    "relevance_score": 1  # Default to least relevant
+                }
+                scored_documents.append(doc_with_score)
+        
+        # Sort the documents by relevance score in descending order
+        sorted_documents = sorted(scored_documents, key=lambda x: x['relevance_score'], reverse=True)
 
-
-
-### Hallucination Grader
-
-# class GradeHallucinations(BaseModel):
-#     """Binary score for hallucination present in generation answer."""
-
-#     binary_score: str = Field(
-#         description="Answer is grounded in the facts, 'yes' or 'no'"
-#     )
+        top_documents = sorted_documents[:top_n]
+        
+        return top_documents
 
 ### Rag Generator
 
@@ -416,3 +465,452 @@ class AnswerGenerator:
         except Exception as e:
             print(f"Error generating answer: {e}")
             return None
+
+class NoRetrievalGenerate:
+    """
+    Generates an answer to the user's question without using any retrieved documents.
+    Uses only the LLM's built-in knowledge.
+    """
+    def __init__(self, model_name: str = "gpt-4", temperature: float = 0):
+        # Initialize the LLM
+        self.llm = ChatOpenAI(model_name=model_name, temperature=temperature)
+        
+        # Define the prompt template
+        self.prompt_template = ChatPromptTemplate.from_messages(
+            [
+                ("system", "You are a helpful assistant."),
+                ("human", "{question}")
+            ]
+        )
+        
+        # Create the chain
+        self.chain = self.prompt_template | self.llm | StrOutputParser()
+    
+    def generate_answer(self, question: str) -> str:
+        """
+        Generates an answer to the question using only the LLM's built-in knowledge.
+        
+        Args:
+            question (str): The user's question.
+        
+        Returns:
+            str: The generated answer.
+        """
+        try:
+            answer = self.chain.invoke({"question": question})
+            return answer
+        except Exception as e:
+            print(f"Error generating answer: {e}")
+            return None
+
+### Fusion Retrieval
+
+def encode_text_and_get_split_documents(text, chunk_size=200, chunk_overlap=200):
+    """
+    Encodes text into a vector store using OpenAI embeddings.
+
+    Args:
+        text (str): The input text string.
+        chunk_size (int): The desired size of each text chunk.
+        chunk_overlap (int): The amount of overlap between consecutive chunks.
+
+    Returns:
+        tuple: A tuple containing the FAISS vector store and the list of cleaned documents.
+    """
+    text_splitter = RecursiveCharacterTextSplitter(
+        chunk_size=chunk_size, chunk_overlap=chunk_overlap, length_function=len
+    )
+    documents = text_splitter.create_documents([text])
+
+    cleaned_texts = replace_t_with_space(documents)
+    embeddings = OpenAIEmbeddings()
+    vectorstore = FAISS.from_documents(cleaned_texts, embeddings)
+
+    return vectorstore, cleaned_texts
+
+def replace_t_with_space(documents: List[Document]) -> List[Document]:
+    """
+    Replaces '\t' characters with spaces in the document content.
+
+    Args:
+        documents (List[Document]): List of Document objects.
+
+    Returns:
+        List[Document]: Cleaned documents.
+    """
+    for doc in documents:
+        doc.page_content = doc.page_content.replace('\t', ' ')
+    return documents
+
+def create_bm25_index(documents: List[Document]) -> BM25Okapi:
+    """
+    Create a BM25 index from the given documents.
+
+    Args:
+        documents (List[Document]): List of documents to index.
+
+    Returns:
+        BM25Okapi: An index that can be used for BM25 scoring.
+    """
+    tokenized_docs = [doc.page_content.split() for doc in documents]
+    return BM25Okapi(tokenized_docs)
+
+def fusion_retrieval(vectorstore, bm25, query: str, k: int = 5, alpha: float = 0.5) -> List[Document]:
+    """
+    Perform fusion retrieval combining keyword-based (BM25) and vector-based search.
+
+    Args:
+        vectorstore (VectorStore): The vectorstore containing the documents.
+        bm25 (BM25Okapi): Pre-computed BM25 index.
+        query (str): The query string.
+        k (int): The number of documents to retrieve.
+        alpha (float): The weight for vector search scores (1-alpha will be the weight for BM25 scores).
+
+    Returns:
+        List[Document]: The top k documents based on the combined scores.
+    """
+    # Retrieve all documents
+    all_docs = vectorstore.similarity_search("", k=vectorstore.index.ntotal)
+
+    # BM25 scores
+    bm25_scores = bm25.get_scores(query.split())
+
+    # Vector search scores
+    vector_results = vectorstore.similarity_search_with_score(query, k=len(all_docs))
+    vector_scores_dict = {doc.page_content: score for doc, score in vector_results}
+    vector_scores = [vector_scores_dict.get(doc.page_content, 0) for doc in all_docs]
+
+    # Normalize scores
+    vector_scores = np.array(vector_scores)
+    vector_scores = 1 - (vector_scores - np.min(vector_scores)) / (np.max(vector_scores) - np.min(vector_scores) + 1e-8)
+    bm25_scores = (bm25_scores - np.min(bm25_scores)) / (np.max(bm25_scores) - np.min(bm25_scores) + 1e-8)
+
+    # Combine scores
+    combined_scores = alpha * vector_scores + (1 - alpha) * bm25_scores
+    sorted_indices = np.argsort(combined_scores)[::-1]
+
+    # Return top k documents
+    return [all_docs[i] for i in sorted_indices[:k]]
+
+class FusionRetrievalRAG:
+    def __init__(self, file_path: str, chunk_size: int = 200, chunk_overlap: int = 200):
+        """
+        Initializes the FusionRetrievalRAG class by setting up the vector store and BM25 index.
+
+        Args:
+            file_path (str): Path to the input file (PDF, DOCX, Markdown).
+            chunk_size (int): The size of each text chunk.
+            chunk_overlap (int): The overlap between consecutive chunks.
+        """
+        # Process the file and perform coreference resolution
+        resolved_text = process_file(file_path)
+
+        # Encode the text and get split documents
+        self.vectorstore, self.cleaned_texts = encode_text_and_get_split_documents(
+            resolved_text, chunk_size, chunk_overlap
+        )
+
+        # Create BM25 index
+        self.bm25 = create_bm25_index(self.cleaned_texts)
+
+    def run(self, query: str, k: int = 5, alpha: float = 0.5):
+        """
+        Executes the fusion retrieval for the given query.
+
+        Args:
+            query (str): The search query.
+            k (int): The number of documents to retrieve.
+            alpha (float): The weight of vector search vs. BM25 search.
+
+        Returns:
+            List[str]: The content of the top k retrieved documents.
+        """
+        top_docs = fusion_retrieval(self.vectorstore, self.bm25, query, k, alpha)
+        docs_content = [doc.page_content for doc in top_docs]
+        return docs_content
+
+
+### Construct Graph
+class GraphState(TypedDict):
+    """
+    Represents the state of our graph.
+
+    Attributes:
+        question: question
+        generation: LLM generation
+        documents: list of documents
+    """
+
+    question: str
+    generation: str
+    documents: List[str]
+
+def retrieve(state, file_path: str):
+    """
+    Retrieve documents
+
+    Args:
+        state (dict): The current graph state
+        file_path (str): Path to the input file for retrieval
+    Returns:
+        state (dict): New key added to state, documents, that contains retrieved documents
+    """
+    print("---RETRIEVE---")
+    question = state["question"]
+
+    # Retrieval
+    documents = FusionRetrievalRAG(file_path).run(query=question, k=5, alpha=0.7)
+    return {"documents": documents, "question": question}
+
+
+def generate(state):
+    """
+    Generate answer
+
+    Args:
+        state (dict): The current graph state
+
+    Returns:
+        state (dict): New key added to state, generation, that contains LLM generation
+    """
+    print("---GENERATE---")
+    question = state["question"]
+    documents = state["documents"]
+
+    # RAG generation
+    generation = AnswerGenerator.generate_answer({"context": documents, "question": question})
+    return {"documents": documents, "question": question, "generation": generation}
+
+
+def grade_documents(state,
+                    score_cutoff: int = 4):
+    """
+    Determines whether the retrieved documents are relevant to the question.
+
+    Args:
+        state (dict): The current graph state
+        score_cutoff: The relevance threshold with which to retain a document in the context
+
+    Returns:
+        state (dict): Updates documents key with only filtered relevant documents
+    """
+
+    print("---CHECK DOCUMENT RELEVANCE TO QUESTION---")
+    question = state["question"]
+    documents = state["documents"]
+
+    # Score each doc
+    filtered_docs = []
+    top_documents = Reranker().rerank_documents(
+        {"query": question, "documents": documents}
+        )
+    for idx, doc in enumerate(top_documents):
+        if doc['relevance_score'] >= score_cutoff:
+            print(f"---DOCUMENT GRADE: {doc['relevance_score']}\n DOCUMENT {idx} RELEVANT---""")
+            filtered_docs.append(doc['content'])
+        else:
+            print(f"---DOCUMENT GRADE: {doc['relevance_score']}\n DOCUMENT {idx} NOT RELEVANT---""")
+            continue
+    return filtered_docs
+
+
+def transform_query(state):
+    """
+    Transform the query to produce a better question.
+
+    Args:
+        state (dict): The current graph state
+
+    Returns:
+        state (dict): Updates question key with a re-phrased question
+    """
+
+    print("---TRANSFORM QUERY---")
+    question = state["question"]
+    documents = state["documents"]
+
+    # Re-write question
+    better_question = QueryTransformer().rewrite_question({"question": question})
+    return {"documents": documents, "question": better_question}
+
+
+def noretreivalgenerate(state):
+    """
+    Ask LLM re-phrased question.
+
+    Args:
+        state (dict): The current graph state
+
+    Returns:
+        str: Answer to user query
+    """
+    print("---QUERY LLM DIRECTLY---")
+    question = state['question']
+    return NoRetrievalGenerate().generate_answer({"question": question})
+
+
+
+### Edges ###
+
+
+def route_question(state, knowledge_base_description: str):
+    """
+    Route question to web search or RAG.
+
+    Args:
+        state (dict): The current graph state
+        knowledge_base_description (str): Description of the knowledge base
+
+    Returns:
+        str: Next node to call
+    """
+
+    print("---ROUTE QUESTION---")
+    question = state["question"]
+    source = QueryAnalyzer(knowledge_base_description).analyze_query(question)
+    if source == "no-retrieval":
+        print("---ROUTE QUESTION TO LLM BUILT IN KNOWLEDGE---")
+        return "no-retrieval"
+    elif source == "vectorstore":
+        print("---ROUTE QUESTION TO RAG---")
+        return "vectorstore"
+
+
+def decide_to_generate(state):
+    """
+    Determines whether to generate an answer, or re-generate a question.
+
+    Args:
+        state (dict): The current graph state
+
+    Returns:
+        str: Binary decision for next node to call
+    """
+
+    print("---ASSESS GRADED DOCUMENTS---")
+    state["question"]
+    filtered_documents = state["documents"]
+
+    if not filtered_documents:
+        # All documents have been filtered check_relevance
+        # We will re-generate a new query
+        print(
+            "---DECISION: ALL DOCUMENTS ARE NOT RELEVANT TO QUESTION, TRANSFORM QUERY---"
+        )
+        return "transform_query"
+    else:
+        # We have relevant documents, so generate answer
+        print("---DECISION: GENERATE---")
+        return "generate"
+
+
+def grade_generation_v_documents_and_question(state):
+    """
+    Determines whether the generation is grounded in the document and answers question.
+
+    Args:
+        state (dict): The current graph state
+
+    Returns:
+        str: Decision for next node to call
+    """
+
+    print("---CHECK HALLUCINATIONS---")
+    question = state["question"]
+    documents = state["documents"]
+    generation = state["generation"]
+
+    grade = HallucinationGrader().grade_hallucination(
+        {"documents": documents, "generation": generation}
+    )
+
+    # Check hallucination
+    if grade == "yes":
+        print("---DECISION: GENERATION IS GROUNDED IN DOCUMENTS---")
+        # Check question-answering
+        print("---GRADE GENERATION vs QUESTION---")
+        grade = AnswerGrader().grade_answer({"question": question, "generation": generation})
+        if grade == "yes":
+            print("---DECISION: GENERATION ADDRESSES QUESTION---")
+            return "useful"
+        else:
+            print("---DECISION: GENERATION DOES NOT ADDRESS QUESTION---")
+            return "not useful"
+    else:
+        pprint("---DECISION: GENERATION IS NOT GROUNDED IN DOCUMENTS, RE-TRY---")
+        return "not supported"
+
+
+
+
+class LangGraphApp:
+    """
+    Class to encapsulate the LangGraph workflow for RAG capabilities.
+    """
+
+    def __init__(self):
+        # Initialize the graph
+        self.workflow = StateGraph(GraphState)
+
+        # Define the nodes
+        self.workflow.add_node("no-retrieval", noretreivalgenerate)  # Query LLM directly
+        self.workflow.add_node("retrieve", retrieve)  # Retrieve documents
+        self.workflow.add_node("grade_documents", grade_documents)  # Grade documents
+        self.workflow.add_node("generate", generate)  # Generate answer
+        self.workflow.add_node("transform_query", transform_query)  # Transform query
+
+        # Build graph
+        self.workflow.add_conditional_edges(
+            START,
+            route_question,
+            {
+                "no-retrieval": "no-retrieval",
+                "vectorstore": "retrieve",
+            },
+        )
+        self.workflow.add_edge("retrieve", "grade_documents")
+        self.workflow.add_conditional_edges(
+            "grade_documents",
+            decide_to_generate,
+            {
+                "transform_query": "transform_query",
+                "generate": "generate",
+            },
+        )
+        self.workflow.add_edge("transform_query", "retrieve")
+        self.workflow.add_conditional_edges(
+            "generate",
+            grade_generation_v_documents_and_question,
+            {
+                "not supported": "generate",
+                "useful": END,
+                "not useful": "transform_query",
+            },
+        )
+
+    def compile_app(self):
+        """
+        Compile the workflow into a callable app.
+
+        Returns:
+            Callable: The compiled app.
+        """
+        return self.workflow.compile()
+
+
+# Function to initialize and compile the LangGraph app
+def create_langgraph_app(knowledge_base_description: str, file_path: str):
+    """
+    Create and return a LangGraph application for RAG.
+
+    Args:
+        knowledge_base_description (str): Description of the knowledge base
+        file_path (str): Path to the input file for retrieval
+
+    Returns:
+        Callable: The compiled LangGraph app.
+    """
+    langgraph_app = LangGraphApp(knowledge_base_description, file_path)
+    return langgraph_app.compile_app()
+
+
