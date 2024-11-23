@@ -1,4 +1,5 @@
 import numpy as np
+import os
 
 from typing import Literal, List
 from typing_extensions import TypedDict
@@ -16,9 +17,13 @@ from typing import List
 from rank_bm25 import BM25Okapi
 from pprint import pprint
 from langgraph.graph import END, StateGraph, START
+from dotenv import load_dotenv
 
 
 from helper_fns import process_file
+
+load_dotenv(os.path.join(os.path.dirname(__file__), "../../config/.env"))
+os.environ["OPENAI_API_KEY"] = os.getenv('OPENAI_API_KEY')
 
 # Variables
 
@@ -41,7 +46,7 @@ class QueryAnalyzer:
     def __init__(
         self,
         knowledge_base_description: str,
-        model_name: str = "gpt-4o",
+        model_name: str = "gpt-4o-mini",
         temperature: float = 0
     ):
         # Initialize the LLM with function calling capabilities
@@ -230,7 +235,7 @@ class HallucinationGrader:
     """
     def __init__(
         self,
-        model_name: str = "gpt-4",
+        model_name: str = "gpt-4o-mini",
         temperature: float = 0,
         max_tokens: int = 1000
     ):
@@ -290,7 +295,7 @@ class AnswerGrader:
     """
     def __init__(
         self,
-        model_name: str = "gpt-4o",
+        model_name: str = "gpt-4o-mini",
         temperature: float = 0
     ):
         
@@ -338,7 +343,7 @@ class Reranker:
     """
     def __init__(
         self,
-        model_name: str = "gpt-4",
+        model_name: str = "gpt-4o-mini",
         temperature: float = 0,
         max_tokens: int = 1000
     ):
@@ -419,12 +424,22 @@ class AnswerGenerator:
     """
     Generates an answer by combining the user's question with the retrieved context (documents).
     """
-    def __init__(self, model_name: str = "gpt-4", temperature: float = 0):
+    def __init__(self, model_name: str = "gpt-4o", temperature: float = 0):
         # Initialize the LLM
         self.llm = ChatOpenAI(model_name=model_name, temperature=temperature)
         
         # Pull the prompt from the hub
-        self.prompt = hub.pull("rlm/rag-prompt")
+        self.prompt = """You are an assistant for question-answering tasks. Use the following pieces of retrieved context to answer the question. 
+                            If you don't know the answer, just say that you don't know. 
+                            Use three sentences maximum and keep the answer concise.
+                            You will be given a step-back query to help retrieve relevant background information. 
+                            You will also be given sub-queries that, when answered together, would provide a comprehensive response to the original query.
+                            You must use the answers to both the step-back query and sub-queries to inform your final answer.
+                            User query: {question} 
+                            Step-back query: {step_back_query}
+                            Sub-queries: {subqueries}
+                            Context: {context} 
+                            Answer:"""
         
         # Create the output parser
         self.output_parser = StrOutputParser()
@@ -438,7 +453,7 @@ class AnswerGenerator:
         """
         return "\n\n".join(doc.page_content for doc in docs)
     
-    def generate_answer(self, question: str, docs):
+    def generate_answer(self, question: str, docs, step_back_query, subqueries):
         """
         Generates an answer to the question using the provided documents as context.
         
@@ -455,7 +470,9 @@ class AnswerGenerator:
         # Prepare the input for the chain
         chain_input = {
             "context": context,
-            "question": question
+            "question": question,
+            "step_back_query": step_back_query,
+            "subqueries": subqueries
         }
         
         # Invoke the chain to get the answer
@@ -471,7 +488,7 @@ class NoRetrievalGenerate:
     Generates an answer to the user's question without using any retrieved documents.
     Uses only the LLM's built-in knowledge.
     """
-    def __init__(self, model_name: str = "gpt-4", temperature: float = 0):
+    def __init__(self, model_name: str = "gpt-4o", temperature: float = 0):
         # Initialize the LLM
         self.llm = ChatOpenAI(model_name=model_name, temperature=temperature)
         
@@ -676,9 +693,16 @@ def generate(state):
     print("---GENERATE---")
     question = state["question"]
     documents = state["documents"]
+    step_back_query = QueryTransformer().generate_stepback_query({"question": question})
+    subqueries = QueryTransformer().decompose_question({"question": question})
 
     # RAG generation
-    generation = AnswerGenerator.generate_answer({"context": documents, "question": question})
+    generation = AnswerGenerator().generate_answer({
+        "context": documents, 
+        "question": question,
+        "step_back_query": step_back_query,
+        "subqueries": subqueries
+        })
     return {"documents": documents, "question": question, "generation": generation}
 
 
@@ -746,7 +770,8 @@ def noretreivalgenerate(state):
     """
     print("---QUERY LLM DIRECTLY---")
     question = state['question']
-    return NoRetrievalGenerate().generate_answer({"question": question})
+    better_question = QueryTransformer().rewrite_question({"question": question})
+    return NoRetrievalGenerate().generate_answer({"question": better_question})
 
 
 
