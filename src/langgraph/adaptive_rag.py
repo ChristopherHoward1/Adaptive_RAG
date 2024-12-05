@@ -5,6 +5,8 @@ import json
 from typing import Literal, List, Any, Dict, Optional
 from typing_extensions import TypedDict
 
+from functools import partial
+
 import faiss
 from llama_index.core import (
     SimpleDirectoryReader,
@@ -21,7 +23,6 @@ from langchain_openai import ChatOpenAI
 from langchain.schema import BaseOutputParser
 from langchain.docstore.document import Document
 from langchain.text_splitter import RecursiveCharacterTextSplitter
-from langchain.embeddings import OpenAIEmbeddings
 from langchain.vectorstores import FAISS
 from typing import List
 from rank_bm25 import BM25Okapi
@@ -29,11 +30,15 @@ from pprint import pprint
 from langgraph.graph import END, StateGraph, START
 from dotenv import load_dotenv
 
+
+from llama_index.embeddings.openai import OpenAIEmbedding
 from llama_index.llms.openai import OpenAI
 from llama_index.core.llms import ChatMessage
 from llama_index.core.tools import FunctionTool
 from llama_index.core import PromptTemplate
 from llama_index.core.node_parser import TextSplitter
+# from llama_index.schema import TextNode, Document
+# from llama_index.text_splitter import TokenTextSplitter
 
 from helper_fns import process_file
 
@@ -104,24 +109,27 @@ class QueryAnalyzer:
         # Call the LLM with predict_and_call
         response = self.llm.predict_and_call(
             [self.tool],
-            prompt=messages
+            messages=messages
         )
 
         # The response should contain the function call with arguments
         # Extract the arguments from response.additional_kwargs['function_call']
-        # if response.additional_kwargs and 'function_call' in response.additional_kwargs:
-        #     function_call = response.additional_kwargs['function_call']
-        #     if function_call.get('name') == 'route_query':
-        #         arguments = function_call.get('arguments')
+        # if response.message.function_call:
+        #     function_call = response.message.function_call
+        #     if function_call.name == 'route_query':
+        #         arguments = function_call.arguments
         #         # arguments is a JSON string
         #         args = json.loads(arguments)
         #         route_query_result = RouteQuery(**args)
         #         return route_query_result.datasource
         # else:
-        #     # Handle unexpected response
         #     return "no-retrieval"
-        return str(response)
-
+        try:
+            datasource = response.sources[0].raw_output.datasource
+            return datasource
+        except (IndexError, AttributeError) as e:
+            print(f"Error extracting datasource: {e}")
+            return "no-retrieval"
 
 
 
@@ -242,18 +250,25 @@ class QueryTransformer:
             temperature=0,  # Override temperature if needed
         )
 
-        # Parse the response
-        if response.additional_kwargs and 'function_call' in response.additional_kwargs:
-            function_call = response.additional_kwargs['function_call']
-            if function_call.get('name') == 'rewrite_query':
-                arguments = function_call.get('arguments')
-                args = json.loads(arguments)
-                rewritten_query_obj = RewrittenQuery(**args)
-                return rewritten_query_obj.rewritten_query
-        else:
-            # Handle unexpected response
-            print(f"Error processing question: {question}")
-            return question  # Return the original question if transformation fails
+        # # Parse the response
+        # if response.additional_kwargs and 'function_call' in response.additional_kwargs:
+        #     function_call = response.additional_kwargs['function_call']
+        #     if function_call.get('name') == 'rewrite_query':
+        #         arguments = function_call.get('arguments')
+        #         args = json.loads(arguments)
+        #         rewritten_query_obj = RewrittenQuery(**args)
+        #         return rewritten_query_obj.rewritten_query
+        # else:
+        #     # Handle unexpected response
+        #     print(f"Error processing question: {question}")
+        #     return question  # Return the original question if transformation fails
+
+        try:
+                rewritten_query = response.sources[0].raw_output.rewritten_query
+                return rewritten_query
+        except (IndexError, AttributeError) as e:
+            print(f"Error extracting datasource: {e}")
+            return question
 
     def generate_stepback_query(self, question: str) -> str:
         """Generates a more general step-back query based on the input question."""
@@ -620,7 +635,7 @@ class AnswerGenerator:
                         If you don't know the answer, just say that you don't know. 
                         Use three sentences maximum and keep the answer concise.
                         You will be given a step-back query to help retrieve relevant background information. 
-                        You will also be given sub-queries that, when answered together, would provide a comprehensive response to the original query.
+                        You will also be given sub-queries that, when answered together, help provide a comprehensive response to the original query.
                         You must use the answers to both the step-back query and sub-queries to guide your final answer.
                         User query: {question} 
                         Step-back query: {step_back_query}
@@ -660,7 +675,6 @@ class AnswerGenerator:
             context=context
         )
         
-        # For chat models, convert the prompt to messages
         messages = self.prompt_template.format_messages(
             question=question,
             step_back_query=step_back_query,
@@ -725,59 +739,109 @@ class NoRetrievalGenerate:
 
 ### Fusion Retrieval
 
-def encode_text_and_get_split_nodes(text, chunk_size=1024):
+# def encode_text_and_get_split_nodes(text: str, 
+#                                     chunk_size=200,
+#                                     chunk_overlap: int = 20) -> tuple[FAISSVectorStore, List[TextNode]]:
+#     """
+#     Encodes text into a FAISS vector store using OpenAI embeddings.
+
+#     Args:
+#         text (str): The input text string.
+#         chunk_size (int): The desired size of each text chunk.
+
+#     Returns:
+#         tuple: A tuple containing the FAISS vector store and the list of nodes.
+#     """
+#     # Initialize the text splitter
+#     text_splitter = TokenTextSplitter(
+#         chunk_size=chunk_size,
+#         chunk_overlap=chunk_overlap,
+#         separator=' ',
+#         backup_separators=[],
+#     )
+
+#     document = Document(text=text)
+
+#     nodes = text_splitter.split_text(document)
+
+#     # Replace 't' with space in the nodes' text
+#     for node in nodes:
+#         node.text = node.text.replace('t', ' ')
+
+#     # Split the text into chunks
+#     text_chunks = text_splitter.split_text(text)
+
+#     # Initialize the OpenAI Embedding model
+#     embed_model = OpenAIEmbedding(model="text-embedding-3-small",)
+
+#     # Generate embeddings for each node
+#     embeddings = []
+#     for node in nodes:
+#         node_embedding = embed_model.get_text_embedding(
+#             node.get_content(metadata_mode="all")
+#         )
+#         node.embedding = node_embedding
+#         embeddings.append(node_embedding)
+
+#     # Create the FAISS index
+#     embedding_dim = embed_model.embedding_dimension
+#     index = faiss.IndexFlatL2(embedding_dim)
+
+#     # Create the FAISS vector store
+#     vector_store = FAISSVectorStore(
+#         faiss_index=index,
+#         embeddings=embedding_model,
+#     )
+
+#     # Add nodes to the vector store
+#     vector_store.add(nodes)
+
+#     return vector_store, nodes
+def encode_text_and_get_split_documents(text: str, chunk_size: int = 200, chunk_overlap: int = 200) -> tuple[FaissVectorStore, List[Document]]:
     """
-    Encodes text into a FAISS vector store using OpenAI embeddings.
+    Encodes text into a vector store using OpenAI embeddings.
 
     Args:
         text (str): The input text string.
         chunk_size (int): The desired size of each text chunk.
+        chunk_overlap (int): The amount of overlap between consecutive chunks.
 
     Returns:
-        tuple: A tuple containing the FAISS vector store and the list of nodes.
+        tuple: A tuple containing the FAISS vector store and the list of cleaned documents.
     """
     # Initialize the text splitter
-    text_parser = SentenceSplitter(
+    text_splitter = RecursiveCharacterTextSplitter(
         chunk_size=chunk_size,
+        chunk_overlap=chunk_overlap
     )
 
-    # Split the text into chunks
-    text_chunks = text_parser.split_text(text)
+    # Split the text into chunks and create Document objects
+    chunks = text_splitter.split_text(text)
+    documents = [Document(text=chunk) for chunk in chunks]
 
-    # Create TextNode objects from chunks
-    nodes = []
-    for text_chunk in text_chunks:
-        # Replace 't' with space in the text chunk
-        cleaned_text = text_chunk.replace('t', ' ')
-        node = TextNode(text=cleaned_text)
-        nodes.append(node)
+    # Replace 't' with space in the documents
+    cleaned_documents = replace_t_with_space(documents)
 
     # Initialize the OpenAI Embedding model
     embedding_model = OpenAIEmbedding()
 
-    # Generate embeddings for each node
-    embeddings = []
-    for node in nodes:
-        node_embedding = embedding_model.get_text_embedding(
-            node.get_content(metadata_mode="all")
-        )
-        node.embedding = node_embedding
-        embeddings.append(node_embedding)
+    # Generate embeddings for the documents
+    embeddings = [embedding_model.get_text_embedding(doc.text) for doc in cleaned_documents]
 
     # Create the FAISS index
     embedding_dim = embedding_model.embedding_dimension
-    index = faiss.IndexFlatL2(embedding_dim)
+    faiss_index = faiss.IndexFlatL2(embedding_dim)
 
     # Create the FAISS vector store
-    vector_store = FAISSVectorStore(
-        faiss_index=index,
-        embeddings=embedding_model,
+    vectorstore = FaissVectorStore(
+        faiss_index=faiss_index,
+        embedding=embedding_model,
     )
 
-    # Add nodes to the vector store
-    vector_store.add(nodes)
+    # Add documents to the vector store
+    vectorstore.add(cleaned_documents)
 
-    return vector_store, nodes
+    return vectorstore, cleaned_documents
 
 def replace_t_with_space(documents: List[Document]) -> List[Document]:
     """
@@ -844,7 +908,7 @@ def fusion_retrieval(vectorstore, bm25, query: str, k: int = 5, alpha: float = 0
     return [all_docs[i] for i in sorted_indices[:k]]
 
 class FusionRetrievalRAG:
-    def __init__(self, file_path: str, chunk_size: int = 200, chunk_overlap: int = 200):
+    def __init__(self, text: str, chunk_size: int = 200, chunk_overlap: int = 200):
         """
         Initializes the FusionRetrievalRAG class by setting up the vector store and BM25 index.
 
@@ -854,7 +918,7 @@ class FusionRetrievalRAG:
             chunk_overlap (int): The overlap between consecutive chunks.
         """
         # Process the file and perform coreference resolution
-        resolved_text = process_file(file_path)
+        resolved_text = text
 
         # Encode the text and get split documents
         self.vectorstore, self.cleaned_texts = encode_text_and_get_split_documents(
@@ -896,7 +960,7 @@ class GraphState(TypedDict):
     generation: str
     documents: List[str]
 
-def retrieve(state, file_path: str):
+def retrieve(state, text: str):
     """
     Retrieve documents
 
@@ -910,7 +974,7 @@ def retrieve(state, file_path: str):
     question = state["question"]
 
     # Retrieval
-    documents = FusionRetrievalRAG(file_path).run(query=question, k=5, alpha=0.7)
+    documents = FusionRetrievalRAG(text).run(query=question, k=5, alpha=0.7)
     return {"documents": documents, "question": question}
 
 
@@ -1108,7 +1172,7 @@ class LangGraphApp:
     Class to encapsulate the LangGraph workflow for RAG capabilities.
     """
 
-    def __init__(self):
+    def __init__(self, knowledge_base_description: str, text: str):
         # Initialize the graph
         self.workflow = StateGraph(GraphState)
 
@@ -1122,7 +1186,7 @@ class LangGraphApp:
         # Build graph
         self.workflow.add_conditional_edges(
             START,
-            route_question,
+            partial(route_question, knowledge_base_description=knowledge_base_description),
             {
                 "no-retrieval": "no-retrieval",
                 "vectorstore": "retrieve",
@@ -1159,7 +1223,7 @@ class LangGraphApp:
 
 
 # Function to initialize and compile the LangGraph app
-def create_langgraph_app(knowledge_base_description: str, file_path: str):
+def create_langgraph_app(knowledge_base_description: str, text: str):
     """
     Create and return a LangGraph application for RAG.
 
@@ -1170,7 +1234,7 @@ def create_langgraph_app(knowledge_base_description: str, file_path: str):
     Returns:
         Callable: The compiled LangGraph app.
     """
-    langgraph_app = LangGraphApp(knowledge_base_description, file_path)
+    langgraph_app = LangGraphApp(knowledge_base_description, text)
     return langgraph_app.compile_app()
 
 
