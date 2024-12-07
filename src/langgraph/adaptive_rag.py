@@ -6,7 +6,9 @@ from typing import Literal, List, Any, Dict, Optional
 from typing_extensions import TypedDict
 
 from functools import partial
+from uuid import uuid4
 
+from langchain_chroma import Chroma
 import faiss
 from llama_index.core import (
     SimpleDirectoryReader,
@@ -69,7 +71,6 @@ class QueryAnalyzer:
         temperature: float = 0,
         strict: bool = True
     ):
-        # Initialize the LLM with function calling capabilities
         self.llm = OpenAI(
             model=model_name,
             temperature=temperature,
@@ -85,7 +86,6 @@ class QueryAnalyzer:
             f"Use the vectorstore for questions on these topics. Otherwise, use no-retrieval."
         )
 
-        # Create the FunctionTool instance inside the class
         self.tool = FunctionTool.from_defaults(fn=self.route_query)
 
     @staticmethod
@@ -111,19 +111,6 @@ class QueryAnalyzer:
             [self.tool],
             messages=messages
         )
-
-        # The response should contain the function call with arguments
-        # Extract the arguments from response.additional_kwargs['function_call']
-        # if response.message.function_call:
-        #     function_call = response.message.function_call
-        #     if function_call.name == 'route_query':
-        #         arguments = function_call.arguments
-        #         # arguments is a JSON string
-        #         args = json.loads(arguments)
-        #         route_query_result = RouteQuery(**args)
-        #         return route_query_result.datasource
-        # else:
-        #     return "no-retrieval"
         try:
             datasource = response.sources[0].raw_output.datasource
             return datasource
@@ -139,9 +126,6 @@ class StrOutputParser(BaseOutputParser):
     """Simple output parser that returns the text as is."""
     def parse(self, text: str) -> str:
         return text.strip()
-    
-# # class SubQueries(BaseModel):
-#     sub_queries: List[str] = Field(description="List of sub-queries generated to help answer the user query.")
 
 class RewrittenQuery(BaseModel):
     rewritten_query: str = Field(
@@ -171,7 +155,7 @@ class QueryTransformer:
         self,
         model_name: str = "gpt-4o-mini",
     ):
-        # Initialize the LLM
+
         self.llm = OpenAI(
             model=model_name,
             temperature=0,
@@ -203,7 +187,6 @@ class QueryTransformer:
             """
         )
 
-        # Create FunctionTools for each function, specifying names
         self.rewrite_tool = FunctionTool.from_defaults(
             fn=self.rewrite_query_function,
             name="rewrite_query"
@@ -234,7 +217,6 @@ class QueryTransformer:
 
     def rewrite_question(self, question: str) -> str:
         """Rewrites the input question to improve vectorstore retrieval performance."""
-        # Create the message list
         messages = [
             ChatMessage(role="system", content=self.rewrite_system_prompt),
             ChatMessage(
@@ -243,36 +225,20 @@ class QueryTransformer:
             ),
         ]
 
-        # Call the LLM with the rewrite_tool
         response = self.llm.predict_and_call(
             [self.rewrite_tool],
-            prompt=messages,
-            temperature=0,  # Override temperature if needed
+            messages=messages,
+            temperature=0,  
         )
-
-        # # Parse the response
-        # if response.additional_kwargs and 'function_call' in response.additional_kwargs:
-        #     function_call = response.additional_kwargs['function_call']
-        #     if function_call.get('name') == 'rewrite_query':
-        #         arguments = function_call.get('arguments')
-        #         args = json.loads(arguments)
-        #         rewritten_query_obj = RewrittenQuery(**args)
-        #         return rewritten_query_obj.rewritten_query
-        # else:
-        #     # Handle unexpected response
-        #     print(f"Error processing question: {question}")
-        #     return question  # Return the original question if transformation fails
-
         try:
-                rewritten_query = response.sources[0].raw_output.rewritten_query
-                return rewritten_query
+            rewritten_query = response.sources[0].raw_output.rewritten_query
+            return rewritten_query
         except (IndexError, AttributeError) as e:
             print(f"Error extracting datasource: {e}")
             return question
 
     def generate_stepback_query(self, question: str) -> str:
         """Generates a more general step-back query based on the input question."""
-        # Create the message list
         messages = [
             ChatMessage(role="system", content=self.stepback_system_prompt),
             ChatMessage(
@@ -284,22 +250,17 @@ class QueryTransformer:
         # Call the LLM with the stepback_tool
         response = self.llm.predict_and_call(
             [self.stepback_tool],
-            prompt=messages,
-            temperature=0,  # Override temperature if needed
+            messages=messages,
+            temperature=0,  
         )
 
         # Parse the response
-        if response.additional_kwargs and 'function_call' in response.additional_kwargs:
-            function_call = response.additional_kwargs['function_call']
-            if function_call.get('name') == 'stepback_query':
-                arguments = function_call.get('arguments')
-                args = json.loads(arguments)
-                stepback_query_obj = StepBackQuery(**args)
-                return stepback_query_obj.stepback_query
-        else:
-            # Handle unexpected response
-            print(f"Error processing question: {question}")
-            return question  # Return the original question if transformation fails
+        try:
+            stepback_query = response.sources[0].raw_output.stepback_query
+            return stepback_query
+        except (IndexError, AttributeError) as e:
+            print(f"Error extracting datasource: {e}")
+            return question
 
     def decompose_question(self, question: str) -> List[str]:
         """Decomposes the input question into simpler sub-questions."""
@@ -315,25 +276,17 @@ class QueryTransformer:
         # Call the LLM with the subquery_tool
         response = self.llm.predict_and_call(
             [self.subquery_tool],
-            prompt=messages,
-            temperature=0.3,  # Override temperature for this call
+            messages=messages,
+            temperature=0.3,  # Higher temperature for more creative subqueries
         )
 
         # Parse the response
-        if response.additional_kwargs and 'function_call' in response.additional_kwargs:
-            function_call = response.additional_kwargs['function_call']
-            if function_call.get('name') == 'decompose_question':
-                arguments = function_call.get('arguments')
-                args = json.loads(arguments)
-                subqueries_obj = SubQueries(**args)
-                subqueries = subqueries_obj.subqueries
-                print("Decomposed Query:")
-                for idx, subquery in enumerate(subqueries):
-                    print(f"Sub-query {idx+1}: {subquery}")
-                return subqueries
-        else:
-            # Handle unexpected response
-            return []  # Return empty list if decomposition fails
+        try:
+            subqueries = response.sources[0].raw_output.subqueries
+            return subqueries
+        except (IndexError, AttributeError) as e:
+            print(f"Error extracting datasource: {e}")
+            return question
 
 
 ### Answer Grader
@@ -354,7 +307,6 @@ class HallucinationGrader:
         max_tokens: int = 1000,
         strict: bool = True,
     ):
-        # Initialize the LLM
         self.llm = OpenAI(
             model=model_name,
             temperature=temperature,
@@ -364,8 +316,8 @@ class HallucinationGrader:
 
         # Define the system prompt
         self.system_prompt = """You are an evaluator determining if an LLM-generated response is based on or supported by a provided set of retrieved facts.
-Provide a binary score: 'yes' or 'no'.
-'Yes' means the answer is grounded in and supported by the facts."""
+                                Provide a binary score: 'yes' or 'no'.
+                                'Yes' means the answer is grounded in and supported by the facts."""
 
         # Create the FunctionTool instance inside the class
         self.tool = FunctionTool.from_defaults(
@@ -396,24 +348,19 @@ Provide a binary score: 'yes' or 'no'.
             # Call the LLM with the tool
             response = self.llm.predict_and_call(
                 [self.tool],
-                prompt=messages,
+                messages=messages,
             )
 
-            # Parse the response
-            if response.additional_kwargs and 'function_call' in response.additional_kwargs:
-                function_call = response.additional_kwargs['function_call']
-                if function_call.get('name') == 'grade_hallucination':
-                    arguments = function_call.get('arguments')
-                    args = json.loads(arguments)
-                    grading_result = HallucinationGradingResult(**args)
-                    return grading_result.score.lower()
+            if response.sources:
+                tool_output = response.sources[0]
+                grading_result = tool_output.raw_output 
+                return grading_result.score.lower()
             else:
-                # Handle unexpected response
-                return 'no'  # Default to 'no' if there is an error
+                # If no sources or unexpected format default to 'no'
+                return 'no'
         except Exception as e:
             print(f"Error grading hallucination: {e}")
-            return 'no'  # Default to 'no' if there is an error
-
+            return 'no' 
 
 
 ### Answer Grader
@@ -436,7 +383,6 @@ class AnswerGrader:
         max_tokens: int = 4000,
         strict: bool = True,
     ):
-        # Initialize the LLM with function calling capabilities
         self.llm = OpenAI(
             model=model_name,
             temperature=temperature,
@@ -446,7 +392,7 @@ class AnswerGrader:
 
         # Define the system prompt
         self.system_prompt = """You are a grader assessing whether an answer addresses or resolves a question.
-Give a binary score 'yes' or 'no'. 'Yes' means that the answer resolves the question."""
+                                Give a binary score 'yes' or 'no'. 'Yes' means that the answer resolves the question."""
 
         # Create the FunctionTool instance inside the class
         self.tool = FunctionTool.from_defaults(
@@ -465,7 +411,6 @@ Give a binary score 'yes' or 'no'. 'Yes' means that the answer resolves the ques
         Returns 'yes' or 'no' based on the grading.
         """
         try:
-            # Create the message list
             messages = [
                 ChatMessage(role="system", content=self.system_prompt),
                 ChatMessage(
@@ -477,21 +422,16 @@ Give a binary score 'yes' or 'no'. 'Yes' means that the answer resolves the ques
             # Call the LLM with the tool
             response = self.llm.predict_and_call(
                 [self.tool],
-                prompt=messages,
+                messages=messages,
             )
 
-            # Parse the response
-            if response.additional_kwargs and 'function_call' in response.additional_kwargs:
-                function_call = response.additional_kwargs['function_call']
-                if function_call.get('name') == 'grade_answer':
-                    arguments = function_call.get('arguments')
-                    # arguments is a JSON string
-                    args = json.loads(arguments)
-                    grading_result = GradeAnswer(**args)
-                    return grading_result.binary_score.lower()
+            if response.sources:
+                tool_output = response.sources[0]
+                grading_result = tool_output.raw_output  # This should be an instance of GradeAnswer
+                return grading_result.binary_score.lower()
             else:
-                # Handle unexpected response
-                return 'no'  # Default to 'no' if there is an error
+                # If no sources or unexpected format, default to 'no'
+                return 'no'
         except Exception as e:
             print(f"Error grading answer: {e}")
             return 'no'  # Default to 'no' if there is an error
@@ -529,7 +469,6 @@ class Reranker:
         max_tokens: int = 1000,
         strict: bool = True,
     ):
-        # Initialize the LLM
         self.llm = OpenAI(
             model=model_name,
             temperature=temperature,
@@ -539,8 +478,8 @@ class Reranker:
 
         # Define the system prompt
         self.system_prompt = """You are an assistant that assigns a relevance score to a document based on its relevance to a query.
-If the document contains keyword(s) or semantic meaning related to the user question, it is considered relevant.
-The relevance score should be an integer from 1 (least relevant) to 10 (most relevant)."""
+                                If the document contains keyword(s) or semantic meaning related to the user question, it is considered relevant.
+                                The relevance score should be an integer from 1 (least relevant) to 10 (most relevant)."""
 
         # Create the FunctionTool instance inside the class
         self.tool = FunctionTool.from_defaults(
@@ -568,7 +507,6 @@ The relevance score should be an integer from 1 (least relevant) to 10 (most rel
 
         for idx, doc in enumerate(documents):
             try:
-                # Prepare the messages
                 messages = [
                     ChatMessage(role="system", content=self.system_prompt),
                     ChatMessage(
@@ -580,24 +518,17 @@ The relevance score should be an integer from 1 (least relevant) to 10 (most rel
                 # Call the LLM with the tool
                 response = self.llm.predict_and_call(
                     [self.tool],
-                    prompt=messages,
+                    messages=messages,
                 )
 
-                # Parse the response
-                if response.additional_kwargs and 'function_call' in response.additional_kwargs:
-                    function_call = response.additional_kwargs['function_call']
-                    if function_call.get('name') == 'assign_relevance_score':
-                        arguments = function_call.get('arguments')
-                        # arguments is a JSON string
-                        args = json.loads(arguments)
-                        relevance_score_obj = RelevanceScore(**args)
-                        relevance_score = relevance_score_obj.relevance_score
-                    else:
-                        relevance_score = 1  # Default to least relevant
+                if response.sources:
+                    tool_output = response.sources[0]
+                    raw_output = tool_output.raw_output
+                    relevance_score = raw_output.relevance_score
                 else:
-                    relevance_score = 1  # Default to least relevant
+                    # If no sources or format is unexpected, default to 1
+                    relevance_score = 1
 
-                # Add the relevance score to the document
                 doc_with_score = {
                     "content": doc,
                     "relevance_score": relevance_score
@@ -626,7 +557,6 @@ class AnswerGenerator:
     Generates an answer by combining the user's question with the retrieved context (documents).
     """
     def __init__(self, model_name: str = "gpt-4o", temperature: float = 0):
-        # Initialize the LLM
         self.llm = OpenAI(model=model_name, temperature=temperature)
         
         # Define the prompt template using LlamaIndex's PromptTemplate
@@ -701,7 +631,6 @@ class NoRetrievalGenerate:
     Uses only the LLM's built-in knowledge.
     """
     def __init__(self, model_name: str = "gpt-4o", temperature: float = 0):
-        # Initialize the LLM
         self.llm = OpenAI(model=model_name, temperature=temperature)
         
         # Define the prompt template
@@ -797,7 +726,27 @@ class NoRetrievalGenerate:
 #     vector_store.add(nodes)
 
 #     return vector_store, nodes
-def encode_text_and_get_split_documents(text: str, chunk_size: int = 200, chunk_overlap: int = 200) -> tuple[FaissVectorStore, List[Document]]:
+def replace_t_with_space(documents: List[Document]) -> List[Document]:
+    """
+    Replaces '\t' characters with spaces in the document content.
+
+    Args:
+        documents (List[Document]): List of Document objects.
+
+    Returns:
+        List[Document]: Cleaned documents.
+    """
+    cleaned_docs = []
+    for doc in documents:
+        cleaned_text = doc.page_content.replace('t', ' ')
+        cleaned_doc = Document(page_content=cleaned_text, metadata=doc.metadata)
+        cleaned_docs.append(cleaned_doc)
+    return cleaned_docs
+
+def encode_text_and_get_split_documents(text: str, 
+                                        chunk_size: int = 200, 
+                                        chunk_overlap: int = 200,
+                                        embedding_model: str = "text-embedding-3-large") -> tuple[Chroma, List[Document]]:
     """
     Encodes text into a vector store using OpenAI embeddings.
 
@@ -822,40 +771,19 @@ def encode_text_and_get_split_documents(text: str, chunk_size: int = 200, chunk_
     # Replace 't' with space in the documents
     cleaned_documents = replace_t_with_space(documents)
 
-    # Initialize the OpenAI Embedding model
-    embedding_model = OpenAIEmbedding()
+    embedding_function = OpenAIEmbedding(embedding_model)
 
-    # Generate embeddings for the documents
-    embeddings = [embedding_model.get_text_embedding(doc.text) for doc in cleaned_documents]
-
-    # Create the FAISS index
-    embedding_dim = embedding_model.embedding_dimension
-    faiss_index = faiss.IndexFlatL2(embedding_dim)
-
-    # Create the FAISS vector store
-    vectorstore = FaissVectorStore(
-        faiss_index=faiss_index,
-        embedding=embedding_model,
+    vector_store = Chroma(
+        collection_name="rag_index",
+        embedding_function=embedding_function,
     )
 
     # Add documents to the vector store
-    vectorstore.add(cleaned_documents)
+    uuids = [str(uuid4()) for _ in range(len(cleaned_documents))]
+    vector_store.add_documents(documents=cleaned_documents, ids=uuids)
 
-    return vectorstore, cleaned_documents
+    return vector_store, cleaned_documents
 
-def replace_t_with_space(documents: List[Document]) -> List[Document]:
-    """
-    Replaces '\t' characters with spaces in the document content.
-
-    Args:
-        documents (List[Document]): List of Document objects.
-
-    Returns:
-        List[Document]: Cleaned documents.
-    """
-    for doc in documents:
-        doc.page_content = doc.page_content.replace('\t', ' ')
-    return documents
 
 def create_bm25_index(documents: List[Document]) -> BM25Okapi:
     """
@@ -870,7 +798,7 @@ def create_bm25_index(documents: List[Document]) -> BM25Okapi:
     tokenized_docs = [doc.page_content.split() for doc in documents]
     return BM25Okapi(tokenized_docs)
 
-def fusion_retrieval(vectorstore, bm25, query: str, k: int = 5, alpha: float = 0.5) -> List[Document]:
+def fusion_retrieval(vectorstore, bm25, query: str, k: int = 5, alpha: float = 0.7) -> List[Document]:
     """
     Perform fusion retrieval combining keyword-based (BM25) and vector-based search.
 
@@ -884,14 +812,15 @@ def fusion_retrieval(vectorstore, bm25, query: str, k: int = 5, alpha: float = 0
     Returns:
         List[Document]: The top k documents based on the combined scores.
     """
-    # Retrieve all documents
-    all_docs = vectorstore.similarity_search("", k=vectorstore.index.ntotal)
+
+    total_docs = vectorstore._collection.count()    
+    all_docs = vectorstore.similarity_search("", k=total_docs)
 
     # BM25 scores
     bm25_scores = bm25.get_scores(query.split())
 
     # Vector search scores
-    vector_results = vectorstore.similarity_search_with_score(query, k=len(all_docs))
+    vector_results = vectorstore.similarity_search_with_score(query, k=total_docs)
     vector_scores_dict = {doc.page_content: score for doc, score in vector_results}
     vector_scores = [vector_scores_dict.get(doc.page_content, 0) for doc in all_docs]
 
@@ -908,7 +837,7 @@ def fusion_retrieval(vectorstore, bm25, query: str, k: int = 5, alpha: float = 0
     return [all_docs[i] for i in sorted_indices[:k]]
 
 class FusionRetrievalRAG:
-    def __init__(self, text: str, chunk_size: int = 200, chunk_overlap: int = 200):
+    def __init__(self, text: str, chunk_size: int = 1000, chunk_overlap: int = 200):
         """
         Initializes the FusionRetrievalRAG class by setting up the vector store and BM25 index.
 
