@@ -18,7 +18,7 @@ from llama_index.core import (
 )
 from llama_index.vector_stores.faiss import FaissVectorStore
 from IPython.display import Markdown, display
-
+from langchain_community.tools.tavily_search import TavilySearchResults
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.pydantic_v1 import BaseModel, Field
 from langchain_openai import ChatOpenAI
@@ -46,6 +46,7 @@ from helper_fns import process_file
 
 load_dotenv(os.path.join(os.path.dirname(__file__), "../../config/.env"))
 os.environ["OPENAI_API_KEY"] = os.getenv('OPENAI_API_KEY')
+os.environ["TAVILY_API_KEY"] = os.getenv('TAVILY_API_KEY')
 
 # Variables
 
@@ -53,9 +54,9 @@ os.environ["OPENAI_API_KEY"] = os.getenv('OPENAI_API_KEY')
 class RouteQuery(BaseModel):
     """Route a user query to the most relevant datasource."""
 
-    datasource: Literal["vectorstore", "no-retrieval"] = Field(
+    datasource: Literal["vectorstore", "web-store"] = Field(
         ...,
-        description="Given a user query, choose to route it to a vectorstore or to the LLM's built-in context.",
+        description="Given a user query, choose to route it to a vectorstore or to web-search.",
     )
 
 class QueryAnalyzer:
@@ -81,9 +82,9 @@ class QueryAnalyzer:
 
         # Define the system prompt
         self.system_prompt = (
-            f"You are an expert at routing a user question to a vectorstore or to an LLM. "
+            f"You are an expert at routing a user question to a vectorstore or web-search. "
             f"The vectorstore contains documents related to: {knowledge_base_description} "
-            f"Use the vectorstore for questions on these topics. Otherwise, use no-retrieval."
+            f"Use the vectorstore for questions on these topics. Otherwise, use web-search."
         )
 
         self.tool = FunctionTool.from_defaults(fn=self.route_query)
@@ -96,7 +97,7 @@ class QueryAnalyzer:
     def analyze_query(self, question: str) -> str:
         """
         Determines the query's relevance to the knowledge base.
-        Returns 'vectorstore' or 'no-retrieval' based on the analysis.
+        Returns 'vectorstore' or 'web-search' based on the analysis.
         """
         # Create the message list using ChatMessage
         messages = [
@@ -116,7 +117,7 @@ class QueryAnalyzer:
             return datasource
         except (IndexError, AttributeError) as e:
             print(f"Error extracting datasource: {e}")
-            return "no-retrieval"
+            return "web-store"
 
 
 
@@ -641,8 +642,7 @@ class NoRetrievalGenerate:
             ]
         )
         
-        # Create the chain
-        #self.chain = self.prompt_template | self.llm | StrOutputParser()
+
     
     def generate_answer(self, question: str) -> str:
         """
@@ -666,66 +666,52 @@ class NoRetrievalGenerate:
             print(f"Error generating answer: {e}")
             return None
 
-### Fusion Retrieval
 
-# def encode_text_and_get_split_nodes(text: str, 
-#                                     chunk_size=200,
-#                                     chunk_overlap: int = 20) -> tuple[FAISSVectorStore, List[TextNode]]:
-#     """
-#     Encodes text into a FAISS vector store using OpenAI embeddings.
+class WebRetriever:
+    """
+    A class to perform web retrieval using TavilySearchResults and format the results
+    as LlamaIndex Document objects.
+    """
 
-#     Args:
-#         text (str): The input text string.
-#         chunk_size (int): The desired size of each text chunk.
+    def __init__(self, api_key: str, k: int = 3):
+        """
+        Initialize the WebRetriever with the TavilySearchResults tool.
 
-#     Returns:
-#         tuple: A tuple containing the FAISS vector store and the list of nodes.
-#     """
-#     # Initialize the text splitter
-#     text_splitter = TokenTextSplitter(
-#         chunk_size=chunk_size,
-#         chunk_overlap=chunk_overlap,
-#         separator=' ',
-#         backup_separators=[],
-#     )
+        Args:
+            api_key (str): Tavily API key.
+            k (int): The number of results to retrieve.
+        """
+        self.web_search_tool = TavilySearchResults(api_key=api_key, k=k)
 
-#     document = Document(text=text)
+    def retrieve(self, query: str) -> List[Document]:
+        """
+        Perform a web search and format the results as LlamaIndex Document objects.
 
-#     nodes = text_splitter.split_text(document)
+        Args:
+            query (str): The search query.
 
-#     # Replace 't' with space in the nodes' text
-#     for node in nodes:
-#         node.text = node.text.replace('t', ' ')
+        Returns:
+            List[Document]: A list of Document objects containing the search results.
+        """
+        try:
+            # Perform the web search
+            results = self.web_search_tool.invoke({"query": query})
 
-#     # Split the text into chunks
-#     text_chunks = text_splitter.split_text(text)
+            # Extract content from the search results
+            documents = [
+                Document(page_content=d["content"], metadata=d.get("metadata", {}))
+                for d in results
+                if "content" in d  # Ensure content exists
+            ]
 
-#     # Initialize the OpenAI Embedding model
-#     embed_model = OpenAIEmbedding(model="text-embedding-3-small",)
+            return documents
 
-#     # Generate embeddings for each node
-#     embeddings = []
-#     for node in nodes:
-#         node_embedding = embed_model.get_text_embedding(
-#             node.get_content(metadata_mode="all")
-#         )
-#         node.embedding = node_embedding
-#         embeddings.append(node_embedding)
+        except Exception as e:
+            print(f"Error during web retrieval: {e}")
+            return []
 
-#     # Create the FAISS index
-#     embedding_dim = embed_model.embedding_dimension
-#     index = faiss.IndexFlatL2(embedding_dim)
 
-#     # Create the FAISS vector store
-#     vector_store = FAISSVectorStore(
-#         faiss_index=index,
-#         embeddings=embedding_model,
-#     )
 
-#     # Add nodes to the vector store
-#     vector_store.add(nodes)
-
-#     return vector_store, nodes
 def replace_t_with_space(documents: List[Document]) -> List[Document]:
     """
     Replaces '\t' characters with spaces in the document content.
@@ -985,7 +971,7 @@ def transform_query(state):
     return {"documents": documents, "question": better_question}
 
 
-def noretreivalgenerate(state):
+def webstore(state):
     """
     Ask LLM re-phrased question.
 
@@ -998,7 +984,7 @@ def noretreivalgenerate(state):
     print("---QUERY LLM DIRECTLY---")
     question = state['question']
     better_question = QueryTransformer().rewrite_question({"question": question})
-    return NoRetrievalGenerate().generate_answer({"question": better_question})
+    return WebstoreRetrievalGenerate().generate_answer({"question": better_question})
 
 
 
@@ -1020,9 +1006,9 @@ def route_question(state, knowledge_base_description: str):
     print("---ROUTE QUESTION---")
     question = state["question"]
     source = QueryAnalyzer(knowledge_base_description).analyze_query(question)
-    if source == "no-retrieval":
+    if source == "web-store":
         print("---ROUTE QUESTION TO LLM BUILT IN KNOWLEDGE---")
-        return "no-retrieval"
+        return "web-store"
     elif source == "vectorstore":
         print("---ROUTE QUESTION TO RAG---")
         return "vectorstore"
@@ -1106,7 +1092,7 @@ class LangGraphApp:
         self.workflow = StateGraph(GraphState)
 
         # Define the nodes
-        self.workflow.add_node("no-retrieval", noretreivalgenerate)  # Query LLM directly
+        self.workflow.add_node("web-store", webstore)  # Query LLM directly
         self.workflow.add_node("retrieve", retrieve)  # Retrieve documents
         self.workflow.add_node("grade_documents", grade_documents)  # Grade documents
         self.workflow.add_node("generate", generate)  # Generate answer
