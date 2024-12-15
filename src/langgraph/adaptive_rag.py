@@ -1,52 +1,47 @@
-import numpy as np
+# Standard library imports
 import os
-import json
-
-from typing import Literal, List, Any, Dict, Optional
-from typing_extensions import TypedDict
-
+import uuid
 from functools import partial
+from pprint import pprint
+from typing import Any, Dict, List, Literal, Optional
 from uuid import uuid4
 
-from langchain_chroma import Chroma
-import faiss
-from llama_index.core import (
-    SimpleDirectoryReader,
-    load_index_from_storage,
-    VectorStoreIndex,
-    StorageContext,
-)
-from llama_index.vector_stores.faiss import FaissVectorStore
+# Third-party imports
+import numpy as np
+from dotenv import load_dotenv
 from IPython.display import Markdown, display
-from langchain_community.tools.tavily_search import TavilySearchResults
-from langchain_core.prompts import ChatPromptTemplate
-from langchain_core.pydantic_v1 import BaseModel, Field
-from langchain_openai import ChatOpenAI
+from pydantic import BaseModel, Field
+from rank_bm25 import BM25Okapi
+
+# LangChain imports
 from langchain.schema import BaseOutputParser
 from langchain.docstore.document import Document
 from langchain.text_splitter import RecursiveCharacterTextSplitter
-from langchain.vectorstores import FAISS
-from typing import List
-from rank_bm25 import BM25Okapi
-from pprint import pprint
-from langgraph.graph import END, StateGraph, START
-from dotenv import load_dotenv
+from langchain_core.prompts import ChatPromptTemplate
+from langchain_community.tools.tavily_search import TavilySearchResults
 
-
+# LlamaIndex imports
+from llama_index.core import PromptTemplate
+from llama_index.core.llms import ChatMessage
+from llama_index.core.node_parser import TextSplitter
+from llama_index.core.tools import FunctionTool
 from llama_index.embeddings.openai import OpenAIEmbedding
 from llama_index.llms.openai import OpenAI
-from llama_index.core.llms import ChatMessage
-from llama_index.core.tools import FunctionTool
-from llama_index.core import PromptTemplate
-from llama_index.core.node_parser import TextSplitter
-# from llama_index.schema import TextNode, Document
-# from llama_index.text_splitter import TokenTextSplitter
+from llama_index.vector_stores.faiss import FaissVectorStore
 
+# LangGraph imports
+from langgraph.graph import END, START, StateGraph
+
+# Langchain-Chroma import
+from langchain_chroma import Chroma
+
+# Local imports
 from helper_fns import process_file
 
 load_dotenv(os.path.join(os.path.dirname(__file__), "../../config/.env"))
 os.environ["OPENAI_API_KEY"] = os.getenv('OPENAI_API_KEY')
 os.environ["TAVILY_API_KEY"] = os.getenv('TAVILY_API_KEY')
+client = OpenAI()
 
 # Variables
 
@@ -54,9 +49,9 @@ os.environ["TAVILY_API_KEY"] = os.getenv('TAVILY_API_KEY')
 class RouteQuery(BaseModel):
     """Route a user query to the most relevant datasource."""
 
-    datasource: Literal["vectorstore", "web-store"] = Field(
+    datasource: Literal["vectorstore", "web_search"] = Field(
         ...,
-        description="Given a user query, choose to route it to a vectorstore or to web-search.",
+        description="Given a user query, choose to route it to a vectorstore or to web search.",
     )
 
 class QueryAnalyzer:
@@ -80,11 +75,10 @@ class QueryAnalyzer:
         )
         self.knowledge_base_description = knowledge_base_description
 
-        # Define the system prompt
         self.system_prompt = (
-            f"You are an expert at routing a user question to a vectorstore or web-search. "
+            f"You are an expert at routing a user question to a vectorstore or web search. "
             f"The vectorstore contains documents related to: {knowledge_base_description} "
-            f"Use the vectorstore for questions on these topics. Otherwise, use web-search."
+            f"Use the vectorstore for questions on these topics. Otherwise, use web search."
         )
 
         self.tool = FunctionTool.from_defaults(fn=self.route_query)
@@ -117,7 +111,7 @@ class QueryAnalyzer:
             return datasource
         except (IndexError, AttributeError) as e:
             print(f"Error extracting datasource: {e}")
-            return "web-store"
+            return "web_search"
 
 
 
@@ -320,7 +314,6 @@ class HallucinationGrader:
                                 Provide a binary score: 'yes' or 'no'.
                                 'Yes' means the answer is grounded in and supported by the facts."""
 
-        # Create the FunctionTool instance inside the class
         self.tool = FunctionTool.from_defaults(
             fn=self.grade_hallucination_function,
             name="grade_hallucination"
@@ -337,7 +330,6 @@ class HallucinationGrader:
         Returns 'yes' or 'no' based on the grading.
         """
         try:
-            # Create the message list
             messages = [
                 ChatMessage(role="system", content=self.system_prompt),
                 ChatMessage(
@@ -346,7 +338,6 @@ class HallucinationGrader:
                 ),
             ]
 
-            # Call the LLM with the tool
             response = self.llm.predict_and_call(
                 [self.tool],
                 messages=messages,
@@ -391,11 +382,9 @@ class AnswerGrader:
             strict=strict
         )
 
-        # Define the system prompt
         self.system_prompt = """You are a grader assessing whether an answer addresses or resolves a question.
                                 Give a binary score 'yes' or 'no'. 'Yes' means that the answer resolves the question."""
 
-        # Create the FunctionTool instance inside the class
         self.tool = FunctionTool.from_defaults(
             fn=self.grade_answer_function,
             name="grade_answer"
@@ -420,7 +409,6 @@ class AnswerGrader:
                 ),
             ]
 
-            # Call the LLM with the tool
             response = self.llm.predict_and_call(
                 [self.tool],
                 messages=messages,
@@ -428,7 +416,7 @@ class AnswerGrader:
 
             if response.sources:
                 tool_output = response.sources[0]
-                grading_result = tool_output.raw_output  # This should be an instance of GradeAnswer
+                grading_result = tool_output.raw_output  
                 return grading_result.binary_score.lower()
             else:
                 # If no sources or unexpected format, default to 'no'
@@ -477,12 +465,10 @@ class Reranker:
             strict=strict
         )
 
-        # Define the system prompt
         self.system_prompt = """You are an assistant that assigns a relevance score to a document based on its relevance to a query.
                                 If the document contains keyword(s) or semantic meaning related to the user question, it is considered relevant.
                                 The relevance score should be an integer from 1 (least relevant) to 10 (most relevant)."""
 
-        # Create the FunctionTool instance inside the class
         self.tool = FunctionTool.from_defaults(
             fn=self.assign_relevance_score_function,
             name="assign_relevance_score"
@@ -516,7 +502,6 @@ class Reranker:
                     ),
                 ]
 
-                # Call the LLM with the tool
                 response = self.llm.predict_and_call(
                     [self.tool],
                     messages=messages,
@@ -543,11 +528,15 @@ class Reranker:
                 }
                 scored_documents.append(doc_with_score)
 
-        # Sort the documents by relevance score in descending order
+        # Sort documents by relevance score in descending order
         sorted_documents = sorted(scored_documents, key=lambda x: x['relevance_score'], reverse=True)
 
-        top_documents = sorted_documents[:top_n]
+        if len(sorted_documents) < top_n:
+            print(f"Warning: Requested top_n={top_n}, but only {len(documents)} documents are available.")
 
+
+        top_documents = sorted_documents[:top_n]
+        
         return top_documents
 
 
@@ -557,10 +546,9 @@ class AnswerGenerator:
     """
     Generates an answer by combining the user's question with the retrieved context (documents).
     """
-    def __init__(self, model_name: str = "gpt-4o", temperature: float = 0):
+    def __init__(self, model_name: str = "gpt-4o-mini", temperature: float = 0):
         self.llm = OpenAI(model=model_name, temperature=temperature)
         
-        # Define the prompt template using LlamaIndex's PromptTemplate
         self.prompt_template = PromptTemplate(
             template="""You are an assistant for question-answering tasks. Use the following pieces of retrieved context to answer the question. 
                         If you don't know the answer, just say that you don't know. 
@@ -598,7 +586,6 @@ class AnswerGenerator:
         # Format the documents
         context = self.format_docs(docs)
         
-        # Prepare the prompt using the PromptTemplate
         prompt = self.prompt_template.format(
             question=question,
             step_back_query=step_back_query,
@@ -613,14 +600,11 @@ class AnswerGenerator:
             context=context
         )
         
-        # Since we're using a single prompt, the messages list will contain one message
-        # You can adjust roles if needed; here we'll set the role as 'user'
         messages = [ChatMessage(role="user", content=prompt)]
         
-        # Invoke the LLM to get the answer
         try:
             response = self.llm.chat(messages)
-            answer = response.content.strip()
+            answer = response.message.content.strip() 
             return answer
         except Exception as e:
             print(f"Error generating answer: {e}")
@@ -634,7 +618,6 @@ class NoRetrievalGenerate:
     def __init__(self, model_name: str = "gpt-4o", temperature: float = 0):
         self.llm = OpenAI(model=model_name, temperature=temperature)
         
-        # Define the prompt template
         self.prompt_template = ChatPromptTemplate.from_messages(
             [
                 ("system", "You are a helpful assistant."),
@@ -655,10 +638,8 @@ class NoRetrievalGenerate:
             str: The generated answer.
         """
         try:
-            # Format the messages
             messages = self.prompt_template.format_messages(question=question)
             
-            # Invoke the LLM
             response = self.llm.chat(messages)
             answer = response.message.content.strip()
             return answer
@@ -673,7 +654,7 @@ class WebRetriever:
     as LlamaIndex Document objects.
     """
 
-    def __init__(self, api_key: str, k: int = 3):
+    def __init__(self, api_key: str, k: int=3):
         """
         Initialize the WebRetriever with the TavilySearchResults tool.
 
@@ -729,10 +710,12 @@ def replace_t_with_space(documents: List[Document]) -> List[Document]:
         cleaned_docs.append(cleaned_doc)
     return cleaned_docs
 
+
 def encode_text_and_get_split_documents(text: str, 
-                                        chunk_size: int = 200, 
+                                        chunk_size: int = 1000, 
                                         chunk_overlap: int = 200,
-                                        embedding_model: str = "text-embedding-3-large") -> tuple[Chroma, List[Document]]:
+                                        embedding_model: str = "text-embedding-3-small",
+                                        collection_name: str = "default_collection",) -> tuple[Chroma, List[Document]]:
     """
     Encodes text into a vector store using OpenAI embeddings.
 
@@ -744,7 +727,6 @@ def encode_text_and_get_split_documents(text: str,
     Returns:
         tuple: A tuple containing the FAISS vector store and the list of cleaned documents.
     """
-    # Initialize the text splitter
     text_splitter = RecursiveCharacterTextSplitter(
         chunk_size=chunk_size,
         chunk_overlap=chunk_overlap
@@ -752,23 +734,22 @@ def encode_text_and_get_split_documents(text: str,
 
     # Split the text into chunks and create Document objects
     chunks = text_splitter.split_text(text)
-    documents = [Document(text=chunk) for chunk in chunks]
+    documents = [Document(page_content=chunk) for chunk in chunks]
 
-    # Replace 't' with space in the documents
-    cleaned_documents = replace_t_with_space(documents)
+    embedding_function = OpenAIEmbeddings(model=embedding_model)
 
-    embedding_function = OpenAIEmbedding(embedding_model)
-
+    # Create the Chroma vector store
     vector_store = Chroma(
-        collection_name="rag_index",
+        collection_name=collection_name,
         embedding_function=embedding_function,
+        persist_directory="./chroma_db",  
     )
 
     # Add documents to the vector store
-    uuids = [str(uuid4()) for _ in range(len(cleaned_documents))]
-    vector_store.add_documents(documents=cleaned_documents, ids=uuids)
-
-    return vector_store, cleaned_documents
+    uuids = [str(uuid4()) for _ in range(len(documents))]
+    vector_store.add_documents(documents=documents, ids=uuids)
+    
+    return vector_store, documents
 
 
 def create_bm25_index(documents: List[Document]) -> BM25Okapi:
@@ -799,16 +780,23 @@ def fusion_retrieval(vectorstore, bm25, query: str, k: int = 5, alpha: float = 0
         List[Document]: The top k documents based on the combined scores.
     """
 
-    total_docs = vectorstore._collection.count()    
+    total_docs = vectorstore._collection.count()
     all_docs = vectorstore.similarity_search("", k=total_docs)
 
-    # BM25 scores
+    # BM25 scores for the query
     bm25_scores = bm25.get_scores(query.split())
 
     # Vector search scores
     vector_results = vectorstore.similarity_search_with_score(query, k=total_docs)
     vector_scores_dict = {doc.page_content: score for doc, score in vector_results}
     vector_scores = [vector_scores_dict.get(doc.page_content, 0) for doc in all_docs]
+
+    # Use minimum length between vector and bm25 scores if they are not equal
+    if len(bm25_scores) != len(vector_scores):
+        min_length = min(len(bm25_scores), len(vector_scores))
+        bm25_scores = bm25_scores[:min_length]
+        vector_scores = vector_scores[:min_length]
+        all_docs = all_docs[:min_length]
 
     # Normalize scores
     vector_scores = np.array(vector_scores)
@@ -832,14 +820,15 @@ class FusionRetrievalRAG:
             chunk_size (int): The size of each text chunk.
             chunk_overlap (int): The overlap between consecutive chunks.
         """
-        # Process the file and perform coreference resolution
-        resolved_text = text
+        self.collection_name = f"rag_index_{uuid.uuid4()}"
 
         # Encode the text and get split documents
         self.vectorstore, self.cleaned_texts = encode_text_and_get_split_documents(
-            resolved_text, chunk_size, chunk_overlap
+            text=text, 
+            chunk_size=chunk_size, 
+            chunk_overlap=chunk_overlap,
+            collection_name=self.collection_name
         )
-
         # Create BM25 index
         self.bm25 = create_bm25_index(self.cleaned_texts)
 
@@ -888,10 +877,19 @@ def retrieve(state, text: str):
     print("---RETRIEVE---")
     question = state["question"]
 
-    # Retrieval
-    documents = FusionRetrievalRAG(text).run(query=question, k=5, alpha=0.7)
-    return {"documents": documents, "question": question}
+    try:
+        raw_documents = FusionRetrievalRAG(text).run(query=question, k=5, alpha=0.7)
 
+        # Ensure all documents are in Document format
+        documents = [
+            Document(page_content=doc) if isinstance(doc, str) else doc
+            for doc in raw_documents
+        ]
+        
+        return {"documents": documents, "question": question}
+    except Exception as e:
+        print(f"Error during retrieval: {e}")
+        return {"documents": [], "question": question}
 
 def generate(state):
     """
@@ -906,17 +904,19 @@ def generate(state):
     print("---GENERATE---")
     question = state["question"]
     documents = state["documents"]
-    step_back_query = QueryTransformer().generate_stepback_query({"question": question})
-    subqueries = QueryTransformer().decompose_question({"question": question})
+    step_back_query = QueryTransformer().generate_stepback_query(question=question)
+    subqueries = QueryTransformer().decompose_question(question=question)
+    better_question = QueryTransformer().rewrite_question(question=question)
+
 
     # RAG generation
-    generation = AnswerGenerator().generate_answer({
-        "context": documents, 
-        "question": question,
-        "step_back_query": step_back_query,
-        "subqueries": subqueries
-        })
-    return {"documents": documents, "question": question, "generation": generation}
+    generation = AnswerGenerator().generate_answer(
+        question=better_question,
+        docs=documents, 
+        step_back_query=step_back_query,
+        subqueries=subqueries
+        )
+    return {"documents": documents, "question": better_question, "generation": generation}
 
 
 def grade_documents(state,
@@ -939,7 +939,8 @@ def grade_documents(state,
     # Score each doc
     filtered_docs = []
     top_documents = Reranker().rerank_documents(
-        {"query": question, "documents": documents}
+        query=question, 
+        documents=documents
         )
     for idx, doc in enumerate(top_documents):
         if doc['relevance_score'] >= score_cutoff:
@@ -948,7 +949,7 @@ def grade_documents(state,
         else:
             print(f"---DOCUMENT GRADE: {doc['relevance_score']}\n DOCUMENT {idx} NOT RELEVANT---""")
             continue
-    return filtered_docs
+    return {"question": question, "documents": filtered_docs}
 
 
 def transform_query(state):
@@ -967,11 +968,11 @@ def transform_query(state):
     documents = state["documents"]
 
     # Re-write question
-    better_question = QueryTransformer().rewrite_question({"question": question})
+    better_question = QueryTransformer().rewrite_question(question=question)
     return {"documents": documents, "question": better_question}
 
 
-def webstore(state):
+def web_search(state):
     """
     Ask LLM re-phrased question.
 
@@ -983,8 +984,10 @@ def webstore(state):
     """
     print("---QUERY LLM DIRECTLY---")
     question = state['question']
-    better_question = QueryTransformer().rewrite_question({"question": question})
-    return WebstoreRetrievalGenerate().generate_answer({"question": better_question})
+    better_question = QueryTransformer().rewrite_question(question=question)
+    web_results = WebRetriever().retrieve(question=better_question)
+    
+    return {"documents": web_results, "question": question} 
 
 
 
@@ -1005,10 +1008,10 @@ def route_question(state, knowledge_base_description: str):
 
     print("---ROUTE QUESTION---")
     question = state["question"]
-    source = QueryAnalyzer(knowledge_base_description).analyze_query(question)
-    if source == "web-store":
-        print("---ROUTE QUESTION TO LLM BUILT IN KNOWLEDGE---")
-        return "web-store"
+    source = QueryAnalyzer(knowledge_base_description).analyze_query(question=question)
+    if source == "web_search":
+        print("---ROUTE QUESTION TO WEBSTORE LOOKUP---")
+        return "web_search"
     elif source == "vectorstore":
         print("---ROUTE QUESTION TO RAG---")
         return "vectorstore"
@@ -1059,8 +1062,8 @@ def grade_generation_v_documents_and_question(state):
     generation = state["generation"]
 
     grade = HallucinationGrader().grade_hallucination(
-        {"documents": documents, 
-        "generation": generation}
+        documents=documents,
+        generation=generation
     )
 
     # Check hallucination
@@ -1068,7 +1071,11 @@ def grade_generation_v_documents_and_question(state):
         print("---DECISION: GENERATION IS GROUNDED IN DOCUMENTS---")
         # Check question-answering
         print("---GRADE GENERATION vs QUESTION---")
-        grade = AnswerGrader().grade_answer({"question": question, "generation": generation})
+        grade = AnswerGrader().grade_answer(
+                                            question=question,
+                                            generation=generation
+                                        )
+
         if grade == "yes":
             print("---DECISION: GENERATION ADDRESSES QUESTION---")
             return "useful"
@@ -1092,8 +1099,8 @@ class LangGraphApp:
         self.workflow = StateGraph(GraphState)
 
         # Define the nodes
-        self.workflow.add_node("web-store", webstore)  # Query LLM directly
-        self.workflow.add_node("retrieve", retrieve)  # Retrieve documents
+        self.workflow.add_node("web_search", web_search)  # Query LLM directly
+        self.workflow.add_node("retrieve", partial(retrieve, text=text))  # Retrieve documents
         self.workflow.add_node("grade_documents", grade_documents)  # Grade documents
         self.workflow.add_node("generate", generate)  # Generate answer
         self.workflow.add_node("transform_query", transform_query)  # Transform query
@@ -1103,7 +1110,7 @@ class LangGraphApp:
             START,
             partial(route_question, knowledge_base_description=knowledge_base_description),
             {
-                "no-retrieval": "no-retrieval",
+                "web_search": "web_search",
                 "vectorstore": "retrieve",
             },
         )
@@ -1144,7 +1151,7 @@ def create_langgraph_app(knowledge_base_description: str, text: str):
 
     Args:
         knowledge_base_description (str): Description of the knowledge base
-        file_path (str): Path to the input file for retrieval
+        text (str): Index
 
     Returns:
         Callable: The compiled LangGraph app.
