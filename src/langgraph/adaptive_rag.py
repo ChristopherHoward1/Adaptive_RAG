@@ -4,6 +4,7 @@ import uuid
 from functools import partial
 from pprint import pprint
 from typing import Any, Dict, List, Literal, Optional
+from typing_extensions import TypedDict
 from uuid import uuid4
 
 # Third-party imports
@@ -19,6 +20,7 @@ from langchain.docstore.document import Document
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_community.tools.tavily_search import TavilySearchResults
+from langchain_openai import OpenAIEmbeddings
 
 # LlamaIndex imports
 from llama_index.core import PromptTemplate
